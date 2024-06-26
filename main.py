@@ -1,14 +1,15 @@
 import torch
 from torch.utils.data import DataLoader
-from torchvision.transforms import Compose, Lambda
+from torchvision.transforms import Lambda
 import numpy as np
 import os
-import cv2
 import matplotlib.pyplot as plt
 from congestion_dataset import CongestionDataset, load_annotations
 from sklearn.model_selection import train_test_split
 from models import GPDL
-
+from utils.metrics import ssim, nrms  # 导入ssim和nrms函数
+from tqdm import tqdm  # 用于进度条显示
+from math import cos, pi
 # 检测是否有 CUDA
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -34,43 +35,13 @@ def create_datasets(train_infos, test_infos, pipeline, ratio):
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     return train_loader, test_loader
 
-# 定义SSIM计算函数
-def ssim(img1, img2):
-    C1 = (0.01 * 255)**2
-    C2 = (0.03 * 255)**2
-
-    img1 = img1.astype(np.float64)
-    img2 = img2.astype(np.float64)
-    kernel = cv2.getGaussianKernel(11, 1.5)
-    window = np.outer(kernel, kernel.transpose())
-
-    mu1 = cv2.filter2D(img1, -1, window)[5:-5, 5:-5]
-    mu2 = cv2.filter2D(img2, -1, window)[5:-5, 5:-5]
-    mu1_sq = mu1**2
-    mu2_sq = mu2**2
-    mu1_mu2 = mu1 * mu2
-    sigma1_sq = cv2.filter2D(img1**2, -1, window)[5:-5, 5:-5] - mu1_sq
-    sigma2_sq = cv2.filter2D(img2**2, -1, window)[5:-5, 5:-5] - mu2_sq
-    sigma12 = cv2.filter2D(img1 * img2, -1, window)[5:-5, 5:-5] - mu1_mu2
-
-    ssim_map = ((2 * mu1_mu2 + C1) *
-                (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) *
-                                       (sigma1_sq + sigma2_sq + C2))
-    return ssim_map.mean()
-
-# 定义NRMSE计算函数
-def NRMSE(pred, target):
-    mse = np.mean((pred - target) ** 2)
-    rmse = np.sqrt(mse)
-    norm = np.sqrt(np.mean(target ** 2))
-    return rmse / norm
-
 # 定义计算指标的函数
 def compute_metrics(pred, target):
-    pred_np = pred.detach().cpu().numpy().squeeze()
-    target_np = target.detach().cpu().numpy().squeeze()
+    # 确保传递的是张量，而不是NumPy数组
+    pred_np = pred.cpu()
+    target_np = target.cpu()
     
-    nrmse = NRMSE(pred_np, target_np)
+    nrmse = nrms(pred_np, target_np)
     ssim_value = ssim(pred_np, target_np)
     
     return nrmse, ssim_value
@@ -97,43 +68,122 @@ def test_model(model, data_loader):
     
     return mean_nrmse, mean_ssim
 
-# 训练模型的函数
-def train_model(model, train_loader, epochs=10, learning_rate=0.001):
+# 保存检查点的函数
+def checkpoint(model, epoch, save_path):
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+    model_out_path = f"./{save_path}/model_iters_{epoch}.pth"
+    torch.save({'state_dict': model.state_dict()}, model_out_path)
+    print(f"Checkpoint saved to {model_out_path}")
+
+# 定义余弦退火学习率调度器类
+class CosineRestartLr(object):
+    def __init__(self, base_lr, periods, restart_weights=[1], min_lr=None, min_lr_ratio=None):
+        self.periods = periods
+        self.min_lr = min_lr
+        self.min_lr_ratio = min_lr_ratio
+        self.restart_weights = restart_weights
+        super().__init__()
+
+        self.cumulative_periods = [
+            sum(self.periods[0:i + 1]) for i in range(0, len(self.periods))
+        ]
+
+        self.base_lr = base_lr
+
+    def annealing_cos(self, start: float, end: float, factor: float, weight: float = 1.) -> float:
+        cos_out = cos(pi * factor) + 1
+        return end + 0.5 * weight * (start - end) * cos_out
+
+    def get_position_from_periods(self, iteration: int, cumulative_periods):
+        for i, period in enumerate(cumulative_periods):
+            if iteration < period:
+                return i
+        raise ValueError(f'Current iteration {iteration} exceeds cumulative_periods {cumulative_periods}')
+
+    def get_lr(self, iter_num, base_lr: float):
+        target_lr = self.min_lr  # type:ignore
+
+        idx = self.get_position_from_periods(iter_num, self.cumulative_periods)
+        current_weight = self.restart_weights[idx]
+        nearest_restart = 0 if idx == 0 else self.cumulative_periods[idx - 1]
+        current_periods = self.periods[idx]
+
+        alpha = min((iter_num - nearest_restart) / current_periods, 1)
+        return self.annealing_cos(base_lr, target_lr, alpha, current_weight)
+
+    def _set_lr(self, optimizer, lr_groups):
+        if isinstance(optimizer, dict):
+            for k, optim in optimizer.items():
+                for param_group, lr in zip(optim.param_groups, lr_groups[k]):
+                    param_group['lr'] = lr
+        else:
+            for param_group, lr in zip(optimizer.param_groups, lr_groups):
+                param_group['lr'] = lr
+
+    def get_regular_lr(self, iter_num):
+        return [self.get_lr(iter_num, _base_lr) for _base_lr in self.base_lr]  # iters
+
+    def set_init_lr(self, optimizer):
+        for group in optimizer.param_groups:  # type: ignore
+            group.setdefault('initial_lr', group['lr'])
+        self.base_lr = [group['initial_lr'] for group in optimizer.param_groups]  # type: ignore
+
+# 使用新的训练方法
+def train_model(model, train_loader, epochs=10, learning_rate=0.001, save_path='checkpoints', print_freq=100, save_freq=10000):
     model.train()
     criterion = torch.nn.MSELoss()  # 假设我们使用均方误差损失函数
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    cosine_lr = CosineRestartLr([learning_rate], [epochs * len(train_loader)], [1], 1e-7)  # 使用余弦退火学习率
+    cosine_lr.set_init_lr(optimizer)
+
     train_loss = []
-    
+    iter_num = 0
+    all_loss = []
+
     for epoch in range(epochs):
         epoch_loss = 0
-        for features, labels, _ in train_loader:
-            features = features.to(device)
-            labels = labels.to(device)
-            
-            optimizer.zero_grad()
-            outputs = model(features)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            
-            epoch_loss += loss.item()
-        
+        with tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}") as bar:
+            for features,labels,_ in train_loader:
+                features = features.to(device)
+                labels = labels.to(device)
+                
+                regular_lr = cosine_lr.get_regular_lr(iter_num)
+                cosine_lr._set_lr(optimizer, regular_lr)
+
+                optimizer.zero_grad()
+                outputs = model(features)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss.item()
+                iter_num += 1
+                bar.update(1)
+                
+                if iter_num % print_freq == 0:
+                    print(f"Iteration {iter_num}, Loss: {loss.item():.4f}")
+
+                if iter_num % save_freq == 0:
+                    checkpoint(model, iter_num, save_path)
+                
+                all_loss.append(loss.item())
+
         avg_loss = epoch_loss / len(train_loader)
         train_loss.append(avg_loss)
-        
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}")
-    
-    return train_loss
+        print(f"Epoch [{epoch+1}/{epochs}], Average Loss: {avg_loss:.4f}")
+
+    return train_loss, all_loss
 
 # 训练数据量的不同大小
-ratio_sizes = [0.8, 0.6, 0.4, 0.2]
+ratio_sizes = [0.8,0.6,0.4,0.2]
 train_infos, test_infos = train_test_split(data_infos, test_size=0.2, random_state=42)
 
 # 用于存储不同 ratio 下的结果
 nrmse_results = []
 ssim_results = []
 train_loss_results = []
+all_loss_results = []
 
 # 循环不同的训练数据量
 for ratio in ratio_sizes:
@@ -146,8 +196,9 @@ for ratio in ratio_sizes:
     train_loader, test_loader = create_datasets(train_infos, test_infos, pipeline, ratio)
     
     # 训练模型
-    train_loss = train_model(model, train_loader, epochs=10, learning_rate=0.001)
+    train_loss, all_loss = train_model(model, train_loader, epochs=10, learning_rate=0.001, save_path='checkpoints', print_freq=100, save_freq=10000)
     train_loss_results.append(train_loss)
+    all_loss_results.extend(all_loss)
     
     # 测试模型
     mean_nrmse, mean_ssim = test_model(model, test_loader)
