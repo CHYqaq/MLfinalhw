@@ -7,21 +7,22 @@ import matplotlib.pyplot as plt
 from congestion_dataset import CongestionDataset, load_annotations
 from sklearn.model_selection import train_test_split
 from models import GPDL
-from utils.metrics import ssim, nrms  # 导入ssim和nrms函数
-from tqdm import tqdm  # 用于进度条显示
+from utils.metrics import ssim, nrms # 导入ssim和nrms函数
+from tqdm import tqdm # 用于进度条显示
 from math import cos, pi
+
 # 检测是否有 CUDA
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 定义数据转换管道
 pipeline = [
-    Lambda(lambda x: {'feature': torch.from_numpy(x['feature']).permute(2, 0, 1).float(), 
-                      'label': torch.from_numpy(x['label']).permute(2, 0, 1).float() if 'label' in x else None, 
+    Lambda(lambda x: {'feature': torch.from_numpy(x['feature']).permute(2, 0, 1).float(),
+                      'label': torch.from_numpy(x['label']).permute(2, 0, 1).float() if 'label' in x else None,
                       'label_path': x['label_path']}),
 ]
 
 # 数据根目录路径
-dataroot = "D:/training_set_forfinal/congestion"  # 替换为实际的数据根目录路径
+dataroot = "D:/training_set_forfinal/congestion" # 替换为实际的数据根目录路径
 
 # 加载数据注释
 data_infos = load_annotations(dataroot)
@@ -40,10 +41,10 @@ def compute_metrics(pred, target):
     # 确保传递的是张量，而不是NumPy数组
     pred_np = pred.cpu()
     target_np = target.cpu()
-    
+
     nrmse = nrms(pred_np, target_np)
     ssim_value = ssim(pred_np, target_np)
-    
+
     return nrmse, ssim_value
 
 # 测试模型的函数
@@ -51,7 +52,7 @@ def test_model(model, data_loader):
     model.eval()
     nrmse_list = []
     ssim_list = []
-    
+
     with torch.no_grad():
         for features, label, label_path in data_loader:
             features = features.to(device)
@@ -62,10 +63,10 @@ def test_model(model, data_loader):
                 nrmse, ssim_value = compute_metrics(outputs[i], label[i])
                 nrmse_list.append(nrmse)
                 ssim_list.append(ssim_value)
-    
+
     mean_nrmse = np.mean(nrmse_list)
     mean_ssim = np.mean(ssim_list)
-    
+
     return mean_nrmse, mean_ssim
 
 # 保存检查点的函数
@@ -130,11 +131,11 @@ class CosineRestartLr(object):
         self.base_lr = [group['initial_lr'] for group in optimizer.param_groups]  # type: ignore
 
 # 使用新的训练方法
-def train_model(model, train_loader, epochs=10, learning_rate=0.001, save_path='checkpoints', print_freq=100, save_freq=10000):
+def train_model(model, train_loader, epochs=20, learning_rate=0.001, save_path='checkpoints', print_freq=100, save_freq=10000):
     model.train()
-    criterion = torch.nn.MSELoss()  # 假设我们使用均方误差损失函数
+    criterion = torch.nn.MSELoss() # 假设我们使用均方误差损失函数
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    cosine_lr = CosineRestartLr([learning_rate], [epochs * len(train_loader)], [1], 1e-7)  # 使用余弦退火学习率
+    cosine_lr = CosineRestartLr([learning_rate], [epochs * len(train_loader)], [1], 1e-7) # 使用余弦退火学习率
     cosine_lr.set_init_lr(optimizer)
 
     train_loss = []
@@ -167,7 +168,7 @@ def train_model(model, train_loader, epochs=10, learning_rate=0.001, save_path='
                 if iter_num % save_freq == 0:
                     checkpoint(model, iter_num, save_path)
                 
-                all_loss.append(loss.item())
+                all_loss.append((iter_num, loss.item()))
 
         avg_loss = epoch_loss / len(train_loader)
         train_loss.append(avg_loss)
@@ -176,7 +177,7 @@ def train_model(model, train_loader, epochs=10, learning_rate=0.001, save_path='
     return train_loss, all_loss
 
 # 训练数据量的不同大小
-ratio_sizes = [0.8,0.6,0.4,0.2]
+ratio_sizes = [0.2]
 train_infos, test_infos = train_test_split(data_infos, test_size=0.2, random_state=42)
 
 # 用于存储不同 ratio 下的结果
@@ -190,33 +191,42 @@ for ratio in ratio_sizes:
     print(f"Training with dataset size ratio: {ratio}")
     # 初始化模型
     model = GPDL()
-    model.to(device)  # 将模型加载到指定设备（CPU 或 GPU）
+    model.to(device) # 将模型加载到指定设备（CPU 或 GPU）
 
     # 创建数据集和数据加载器
     train_loader, test_loader = create_datasets(train_infos, test_infos, pipeline, ratio)
-    
+
     # 训练模型
-    train_loss, all_loss = train_model(model, train_loader, epochs=10, learning_rate=0.001, save_path='checkpoints', print_freq=100, save_freq=10000)
+    train_loss, all_loss = train_model(model, train_loader, epochs=20, learning_rate=0.001, save_path='checkpoints', print_freq=100, save_freq=10000)
     train_loss_results.append(train_loss)
-    all_loss_results.extend(all_loss)
-    
+    all_loss_results.append(all_loss)
+    '''
+    # 绘制每个 ratio 的训练损失随迭代次数的变化图像
+    plt.figure()
+    plt.plot([x[0] for x in all_loss], [x[1] for x in all_loss], label=f'Ratio: {ratio}')
+    plt.xlabel('Iterations')
+    plt.ylabel('Loss')
+    plt.title(f'Training Loss over Iterations for Ratio {ratio}')
+    plt.legend()
+    plt.show()
+    '''
     # 测试模型
     mean_nrmse, mean_ssim = test_model(model, test_loader)
     nrmse_results.append(mean_nrmse)
     ssim_results.append(mean_ssim)
-    
+
     # 输出结果
     print(f"Ratio: {ratio}")
     print(f"Mean NRMSE: {mean_nrmse:.4f}")
     print(f"Mean SSIM: {mean_ssim:.4f}")
-    
-    # 画出训练损失随迭代次数的变化曲线
-    plt.plot(range(1, len(train_loss)+1), train_loss, label=f'Ratio: {ratio}')
 
-# 显示所有训练损失曲线
-plt.xlabel('Epochs')
-plt.ylabel('Training Loss')
-plt.title('Training Loss over Epochs for Different Ratios')
+# 画出训练损失随迭代次数的变化曲线（总图像）
+plt.figure()
+for ratio, all_loss in zip(ratio_sizes, all_loss_results):
+    plt.plot([x[0] for x in all_loss], [x[1] for x in all_loss], label=f'Ratio: {ratio}')
+plt.xlabel('Iterations')
+plt.ylabel('Loss')
+plt.title('Training Loss over Iterations for Different Ratios')
 plt.legend()
 plt.show()
 
