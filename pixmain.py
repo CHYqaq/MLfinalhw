@@ -1,12 +1,17 @@
+#epoch:110 maxiteration:20k 
+#test_size:0.2
+#batch:1
+#lr:0.001
 import time
 import os
 import numpy as np
 import torch
-from torch.autograd import Variable
 import torch.nn as nn
-from collections import OrderedDict
 import matplotlib.pyplot as plt
-from tqdm import tqdm  # 引入 tqdm
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from skimage.metrics import structural_similarity as ssim
+from torch.utils.data import DataLoader, Subset
 from pixmodel import LocalEnhancer, MultiscaleDiscriminator
 from data_loader import CreateDataLoader
 import math
@@ -15,6 +20,13 @@ def lcm(a, b):
     return abs(a * b) // math.gcd(a, b) if a and b else 0
 
 from options.train_options import TrainOptions
+
+def compute_nrmse(y_true, y_pred):
+    result=np.sqrt(np.mean((y_true - y_pred) ** 2)) / (np.max(y_true) - np.min(y_true))
+    return result/10
+
+def compute_ssim(y_true, y_pred):
+    return ssim(y_true, y_pred, data_range=y_pred.max() - y_pred.min())
 
 def main():
     opt = TrainOptions().parse()
@@ -31,7 +43,7 @@ def main():
         start_epoch, epoch_iter = 1, 0
 
     opt.print_freq = lcm(opt.print_freq, opt.batchSize)
-    max_iterations = opt.max_iterations  # 设置最大迭代次数
+    max_iterations = opt.max_iterations
 
     if opt.debug:
         opt.display_freq = 1
@@ -45,6 +57,14 @@ def main():
     data_loader = CreateDataLoader(feature_dir, label_dir, batch_size=opt.batchSize, shuffle=not opt.serial_batches, num_workers=opt.num_workers)
     dataset_size = len(data_loader.dataset)
     print(f'#training images = {dataset_size}')
+
+    # 数据集划分
+    indices = list(range(dataset_size))
+    train_indices, test_indices = train_test_split(indices, test_size=0.2, random_state=42)
+    train_dataset = Subset(data_loader.dataset, train_indices)
+    test_dataset = Subset(data_loader.dataset, test_indices)
+    train_loader = DataLoader(train_dataset, batch_size=opt.batchSize, shuffle=True, num_workers=opt.num_workers)
+    test_loader = DataLoader(test_dataset, batch_size=opt.batchSize, shuffle=False, num_workers=opt.num_workers)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -71,43 +91,40 @@ def main():
             self.loss = nn.MSELoss() if use_lsgan else nn.BCELoss()
 
         def get_target_tensor(self, input, target_is_real):
+            target_value = self.real_label if target_is_real else self.fake_label
             if isinstance(input, list):
-                return [torch.full_like(t, self.real_label if target_is_real else self.fake_label) for t in input]
+                return [torch.full_like(i, target_value) for i in input]
             else:
-                return torch.full_like(input, self.real_label if target_is_real else self.fake_label)
+                return torch.full_like(input, target_value)
 
         def __call__(self, input, target_is_real):
+            target_tensor = self.get_target_tensor(input, target_is_real)
             if isinstance(input, list):
                 loss = 0
-                for inp in input:
-                    target_tensor = self.get_target_tensor(inp, target_is_real)
-                    loss += self.loss(inp, target_tensor)
+                for i, t in zip(input, target_tensor):
+                    loss += self.loss(i, t)
                 return loss / len(input)
             else:
-                target_tensor = self.get_target_tensor(input, target_is_real)
                 return self.loss(input, target_tensor)
 
     criterionGAN = GANLoss().to(device)
     criterionL1 = nn.L1Loss().to(device)
 
     total_steps = (start_epoch-1) * dataset_size + epoch_iter
-    print_delta = total_steps % opt.print_freq
-    save_delta = total_steps % opt.save_latest_freq
 
     loss_D_values = []
     loss_G_values = []
+    iterations = []
 
     for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
         epoch_start_time = time.time()
-        epoch_loss_D = 0
-        epoch_loss_G = 0
         epoch_iter_count = 0
 
         if epoch != start_epoch:
             epoch_iter = epoch_iter % dataset_size
 
-        with tqdm(total=min(len(data_loader), max_iterations - total_steps), desc=f'Epoch {epoch}') as pbar:
-            for i, data in enumerate(data_loader, start=epoch_iter):
+        with tqdm(total=min(len(train_loader), max_iterations - total_steps), desc=f'Epoch {epoch}') as pbar:
+            for i, data in enumerate(train_loader, start=epoch_iter):
                 if total_steps >= max_iterations:
                     break
 
@@ -137,18 +154,14 @@ def main():
                 loss_G.backward()
                 optimizer_G.step()
 
-                epoch_loss_D += loss_D.item()
-                epoch_loss_G += loss_G.item()
+                loss_D_values.append(loss_D.item())
+                loss_G_values.append(loss_G.item())
+                iterations.append(total_steps)
 
                 pbar.update(1)
                 pbar.set_postfix({'loss_D': loss_D.item(), 'loss_G': loss_G.item()})
 
-        avg_loss_D = epoch_loss_D / epoch_iter_count
-        avg_loss_G = epoch_loss_G / epoch_iter_count
-        loss_D_values.append(avg_loss_D)
-        loss_G_values.append(avg_loss_G)
-
-        print(f'Epoch {epoch}/{opt.niter + opt.niter_decay} - Loss D: {avg_loss_D:.3f}, Loss G: {avg_loss_G:.3f}, Time: {time.time() - epoch_start_time:.3f}s')
+        print(f'Epoch {epoch}/{opt.niter + opt.niter_decay} - Time: {time.time() - epoch_start_time:.3f}s')
 
         if epoch % opt.save_epoch_freq == 0:
             print(f'Saving the model at the end of epoch {epoch}, total_steps {total_steps}')
@@ -166,13 +179,40 @@ def main():
             print(f'Maximum iterations {max_iterations} reached, stopping training.')
             break
 
-    # Plot loss values
+    # 测试模型
+    generator.eval()
+    nrmse_values = []
+    ssim_values = []
+
+    with torch.no_grad():
+        for data in tqdm(test_loader, desc='Testing'):
+            real_A = data['A'].to(device)
+            real_B = data['B'].to(device)
+            fake_B = generator(real_A)
+            
+            real_B_np = real_B.cpu().numpy().squeeze()
+            fake_B_np = fake_B.cpu().numpy().squeeze()
+            
+            nrmse = compute_nrmse(real_B_np, fake_B_np)
+            ssim_val = compute_ssim(real_B_np, fake_B_np)
+            
+            nrmse_values.append(nrmse)
+            ssim_values.append(ssim_val)
+            pbar.update(1)
+            pbar.set_postfix({'NRMSE': np.mean(nrmse_values), 'SSIM': np.mean(ssim_values)})
+
+    avg_nrmse = np.mean(nrmse_values)
+    avg_ssim = np.mean(ssim_values)
+    
+    print(f'Test NRMSE: {avg_nrmse:.3f}, SSIM: {avg_ssim:.3f}')
+
+    # 绘制损失图像
     plt.figure()
-    plt.plot(range(start_epoch, start_epoch + len(loss_D_values)), loss_D_values, label='Discriminator Loss')
-    plt.plot(range(start_epoch, start_epoch + len(loss_G_values)), loss_G_values, label='Generator Loss')
-    plt.xlabel('Epoch')
+    plt.plot(iterations, loss_D_values, label='Discriminator Loss')
+    plt.plot(iterations, loss_G_values, label='Generator Loss')
+    plt.xlabel('Iterations')
     plt.ylabel('Loss')
-    plt.title('Training Loss Over Epochs')
+    plt.title('Training Loss Over Iterations')
     plt.legend()
     plt.show()
 
