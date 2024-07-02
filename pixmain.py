@@ -1,7 +1,3 @@
-#epoch:110 maxiteration:20k 
-#test_size:0.2
-#batch:1
-#lr:0.001
 import time
 import os
 import numpy as np
@@ -22,16 +18,67 @@ def lcm(a, b):
 from options.train_options import TrainOptions
 
 def compute_nrmse(y_true, y_pred):
-    result=np.sqrt(np.mean((y_true - y_pred) ** 2)) / (np.max(y_true) - np.min(y_true))
-    return result/10
+    result = np.sqrt(np.mean((y_true - y_pred) ** 2)) / (np.max(y_true) - np.min(y_true))
+    return result
 
 def compute_ssim(y_true, y_pred):
     return ssim(y_true, y_pred, data_range=y_pred.max() - y_pred.min())
 
+def normalize_min_max(arr):
+    """将数组进行最大最小值归一化"""
+    return (arr - arr.min()) / (arr.max() - arr.min())
+
+def compute_accuracy(y_true, y_pred, bins=5):
+    # 将 y_true 和 y_pred 进行最大最小值归一化
+    y_true_norm = normalize_min_max(y_true)
+    y_pred_norm = normalize_min_max(y_pred)
+
+    # 创建分段
+    thresholds = np.linspace(0, 1, bins + 1)
+    
+    # 将归一化后的值分段
+    y_true_discrete = np.digitize(y_true_norm, bins=thresholds, right=True)
+    y_pred_discrete = np.digitize(y_pred_norm, bins=thresholds, right=True)
+
+    # 计算预测正确的像素数
+    correct_predictions = np.sum(y_true_discrete == y_pred_discrete)
+    total_pixels = y_true.size
+    accuracy = correct_predictions / total_pixels
+    return accuracy
+
+
+def compute_peak_nrmse(y_true, y_pred, ks=[0.5, 1, 2, 5]):
+    h, w = y_true.shape
+    peak_nrmse_results = {}
+    sum = 0
+    for k in ks:
+        top_k_elements = int(np.ceil(h * w * (k / 100)))
+        
+        # Flatten the arrays
+        y_true_flat = y_true.flatten()
+        y_pred_flat = y_pred.flatten()
+        
+        # Sort by congestion value (y_true values)
+        sorted_indices = np.argsort(y_true_flat)[::-1]  # descending order
+        sorted_y_true = y_true_flat[sorted_indices]
+        sorted_y_pred = y_pred_flat[sorted_indices]
+        
+        # Select top k elements
+        top_k_true = sorted_y_true[:top_k_elements]
+        top_k_pred = sorted_y_pred[:top_k_elements]
+        
+        # Compute NRMSE for top k elements
+        nrmse = np.sqrt(np.mean((top_k_true - top_k_pred) ** 2)) / (np.max(y_true) - np.min(y_true))
+        sum += nrmse
+        peak_nrmse_results[f'top_{k}%'] = nrmse
+
+    return peak_nrmse_results, sum / 4
+
 def main():
+    start_time = time.time()
     opt = TrainOptions().parse()
     opt.num_workers = 0
-    iter_path = os.path.join(opt.checkpoints_dir, opt.name, 'C:/Users/DELL/Desktop/iter.txt')
+    iter_path = os.path.join(opt.checkpoints_dir, opt.name, 'iter.txt')
     
     if opt.continue_train:
         try:
@@ -60,11 +107,11 @@ def main():
 
     # 数据集划分
     indices = list(range(dataset_size))
-    train_indices, test_indices = train_test_split(indices, test_size=0.2, random_state=42)
+    train_indices, test_indices = train_test_split(indices, train_size=0.7, random_state=42)
     train_dataset = Subset(data_loader.dataset, train_indices)
     test_dataset = Subset(data_loader.dataset, test_indices)
-    train_loader = DataLoader(train_dataset, batch_size=opt.batchSize, shuffle=True, num_workers=opt.num_workers)
-    test_loader = DataLoader(test_dataset, batch_size=opt.batchSize, shuffle=False, num_workers=opt.num_workers)
+    train_loader = DataLoader(train_dataset, batch_size=opt.train_batch, shuffle=True, num_workers=opt.num_workers)
+    test_loader = DataLoader(test_dataset, batch_size=opt.test_batch, shuffle=False, num_workers=opt.num_workers)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -80,8 +127,8 @@ def main():
     generator = LocalEnhancer(input_nc, output_nc, ngf, n_local_enhancers, n_blocks).to(device)
     discriminator = MultiscaleDiscriminator(input_nc + output_nc, ndf, n_layers_D, num_D).to(device)
 
-    optimizer_G = torch.optim.Adam(generator.parameters(), lr=0.0002, betas=(0.5, 0.999))
-    optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
+    optimizer_G = torch.optim.Adam(generator.parameters(), lr=0.001, betas=(0.5, 0.999))
+    optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=0.001, betas=(0.5, 0.999))
 
     class GANLoss(nn.Module):
         def __init__(self, use_lsgan=True, target_real_label=1.0, target_fake_label=0.0):
@@ -114,6 +161,7 @@ def main():
 
     loss_D_values = []
     loss_G_values = []
+    pix_accuracy_values = []
     iterations = []
 
     for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
@@ -122,6 +170,8 @@ def main():
 
         if epoch != start_epoch:
             epoch_iter = epoch_iter % dataset_size
+
+        epoch_pix_accuracies = []
 
         with tqdm(total=min(len(train_loader), max_iterations - total_steps), desc=f'Epoch {epoch}') as pbar:
             for i, data in enumerate(train_loader, start=epoch_iter):
@@ -158,10 +208,17 @@ def main():
                 loss_G_values.append(loss_G.item())
                 iterations.append(total_steps)
 
+                # Compute pix accuracy for this batch
+                real_B_np = real_B.cpu().numpy().squeeze()
+                fake_B_np = fake_B.cpu().detach().numpy().squeeze()
+                pix_accuracy = compute_accuracy(real_B_np, fake_B_np)
+                epoch_pix_accuracies.append(pix_accuracy)
+                pix_accuracy_values.append(pix_accuracy)
                 pbar.update(1)
-                pbar.set_postfix({'loss_D': loss_D.item(), 'loss_G': loss_G.item()})
+                pbar.set_postfix({'loss_D': loss_D.item(), 'loss_G': loss_G.item(), 'pix_accuracy': pix_accuracy})
 
-        print(f'Epoch {epoch}/{opt.niter + opt.niter_decay} - Time: {time.time() - epoch_start_time:.3f}s')
+        avg_epoch_pix_accuracy = np.mean(epoch_pix_accuracies)
+        print(f'Epoch {epoch}/{opt.niter + opt.niter_decay} - Time: {time.time() - epoch_start_time:.3f}s - Pix Accuracy: {avg_epoch_pix_accuracy:.4f}')
 
         if epoch % opt.save_epoch_freq == 0:
             print(f'Saving the model at the end of epoch {epoch}, total_steps {total_steps}')
@@ -183,38 +240,77 @@ def main():
     generator.eval()
     nrmse_values = []
     ssim_values = []
+    pix_accuracy_values_test = []
+    peak_nrmse_results_list = []
 
     with torch.no_grad():
-        for data in tqdm(test_loader, desc='Testing'):
-            real_A = data['A'].to(device)
-            real_B = data['B'].to(device)
-            fake_B = generator(real_A)
-            
-            real_B_np = real_B.cpu().numpy().squeeze()
-            fake_B_np = fake_B.cpu().numpy().squeeze()
-            
-            nrmse = compute_nrmse(real_B_np, fake_B_np)
-            ssim_val = compute_ssim(real_B_np, fake_B_np)
-            
-            nrmse_values.append(nrmse)
-            ssim_values.append(ssim_val)
-            pbar.update(1)
-            pbar.set_postfix({'NRMSE': np.mean(nrmse_values), 'SSIM': np.mean(ssim_values)})
+        with tqdm(total=len(test_loader), desc='Testing') as pbar:
+            for data in test_loader:
+                real_A = data['A'].to(device)
+                real_B = data['B'].to(device)
+                fake_B = generator(real_A)
+                
+                real_B_np = real_B.cpu().numpy().squeeze()
+                fake_B_np = fake_B.cpu().numpy().squeeze()
+                
+                nrmse = compute_nrmse(real_B_np, fake_B_np)
+                ssim_val = compute_ssim(real_B_np, fake_B_np)
+                pix_accuracy = compute_accuracy(real_B_np, fake_B_np)
+                
+                nrmse_values.append(nrmse)
+                ssim_values.append(ssim_val)
+                pix_accuracy_values_test.append(pix_accuracy)
 
-    avg_nrmse = np.mean(nrmse_values)
-    avg_ssim = np.mean(ssim_values)
-    
-    print(f'Test NRMSE: {avg_nrmse:.3f}, SSIM: {avg_ssim:.3f}')
+                # Compute peak NRMSE for this batch
+                peak_nrmse_results, avg_peak_nrmse = compute_peak_nrmse(real_B_np, fake_B_np)
+                peak_nrmse_results_list.append(peak_nrmse_results)
+                
+                pbar.update(1)
+                pbar.set_postfix({'NRMSE': np.mean(nrmse_values), 'SSIM': np.mean(ssim_values)})
+            
+        avg_nrmse = np.mean(nrmse_values)
+        avg_ssim = np.mean(ssim_values)
+        avg_pix_accuracy_test = np.mean(pix_accuracy_values_test)
+        avg_avg_peak_nrmse = 0
+        # Aggregate peak NRMSE results
+        avg_peak_nrmse_results = {}
+        end_time = time.time()
+        sum_time = end_time - start_time
+        print("总用时：", sum_time)
+        
+        for k in peak_nrmse_results_list[0].keys():
+            avg_peak_nrmse_results[k] = np.mean([result[k] for result in peak_nrmse_results_list])
+            avg_avg_peak_nrmse += avg_peak_nrmse
+        print(f'Test NRMSE: {avg_nrmse:.3f}, SSIM: {avg_ssim:.3f}, Pix Accuracy: {avg_pix_accuracy_test:.3f}')
+        for k, v in avg_peak_nrmse_results.items():
+            print(f'Peak NRMSE {k}: {v:.3f}')
+        print(f'average_peak_nrmse:', avg_avg_peak_nrmse / 4)
+        
+        # 绘制损失和pix accuracy图像
+        plt.figure()
+        plt.plot(iterations, loss_D_values, label='Discriminator Loss')
+        plt.xlabel('Iterations')
+        plt.ylabel('Loss')
+        plt.title('Training Loss Over Iterations')
+        plt.legend()
+        plt.show()
 
-    # 绘制损失图像
-    plt.figure()
-    plt.plot(iterations, loss_D_values, label='Discriminator Loss')
-    plt.plot(iterations, loss_G_values, label='Generator Loss')
-    plt.xlabel('Iterations')
-    plt.ylabel('Loss')
-    plt.title('Training Loss Over Iterations')
-    plt.legend()
-    plt.show()
+        # 绘制损失和pix accuracy图像
+        plt.figure()
+        plt.plot(iterations, loss_G_values, label='Generator Loss')
+        plt.xlabel('Iterations')
+        plt.ylabel('Loss')
+        plt.title('Training Loss Over Iterations')
+        plt.legend()
+        plt.show()
+        
+        plt.figure()
+        plt.plot(range(len(pix_accuracy_values)), pix_accuracy_values, label='Pix Accuracy')
+        plt.xlabel('Iterations')
+        plt.ylabel('Pix Accuracy')
+        plt.title('Pix Accuracy Over Iterations')
+        plt.legend()
+        plt.show()
 
 if __name__ == '__main__':
     main()
